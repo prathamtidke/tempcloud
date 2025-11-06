@@ -1,0 +1,450 @@
+import 'dart:io';
+import 'dart:ui';
+import 'package:flutter/material.dart';
+import 'package:firebase_auth/firebase_auth.dart';
+import 'package:firebase_storage/firebase_storage.dart';
+import 'package:cloud_firestore/cloud_firestore.dart';
+import 'package:image_picker/image_picker.dart';
+import 'package:http/http.dart' as http;
+import 'package:permission_handler/permission_handler.dart';
+import 'package:path_provider/path_provider.dart';
+import 'package:path/path.dart' as p;
+
+// =========================================================
+// # HomeScreen Widget
+// =========================================================
+class HomeScreen extends StatefulWidget {
+  const HomeScreen({super.key});
+
+  @override
+  State<HomeScreen> createState() => _HomeScreenState();
+}
+
+class _HomeScreenState extends State<HomeScreen> {
+  final user = FirebaseAuth.instance.currentUser;
+  final picker = ImagePicker();
+  bool _isUploading = false;
+
+  // =========================================================
+  // # Upload Image Function
+  // =========================================================
+  Future<void> _uploadImage() async {
+    final pickedFile = await picker.pickImage(source: ImageSource.gallery);
+    if (pickedFile == null) return;
+
+    setState(() => _isUploading = true);
+    final file = File(pickedFile.path);
+
+    try {
+      final storageRef = FirebaseStorage.instance
+          .ref()
+          .child('user_uploads/${user!.uid}/${DateTime.now().millisecondsSinceEpoch}.jpg');
+
+      await storageRef.putFile(file);
+      final url = await storageRef.getDownloadURL();
+
+      await FirebaseFirestore.instance.collection('uploads').add({
+        'url': url,
+        'userId': user!.uid,
+        'timestamp': FieldValue.serverTimestamp(),
+      });
+
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('Uploaded successfully ✅')),
+      );
+    } catch (e) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text("Upload failed: $e")),
+      );
+    } finally {
+      setState(() => _isUploading = false);
+    }
+  }
+
+  // =========================================================
+  // # Download Function (Android 13+ Supported)
+  // =========================================================
+  Future<void> _downloadFile(String url) async {
+    try {
+      if (Platform.isAndroid) {
+        final androidVersion = int.tryParse(
+            (await _getAndroidVersion())?.split('.')?.first ?? '13');
+        if (androidVersion != null && androidVersion < 13) {
+          final status = await Permission.storage.request();
+          if (!status.isGranted) {
+            ScaffoldMessenger.of(context).showSnackBar(
+              const SnackBar(content: Text('Storage permission denied 🚫')),
+            );
+            return;
+          }
+        }
+      }
+
+      Directory? downloadDir;
+      if (Platform.isAndroid) {
+        downloadDir = Directory('/storage/emulated/0/Download/CloudVaultora');
+      } else {
+        downloadDir = await getApplicationDocumentsDirectory();
+      }
+      if (!(await downloadDir.exists())) {
+        await downloadDir.create(recursive: true);
+      }
+
+      final fileName = p.basename(Uri.parse(url).path);
+      final file = File('${downloadDir.path}/$fileName');
+
+      final response = await http.get(Uri.parse(url));
+      await file.writeAsBytes(response.bodyBytes);
+
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('✅ Saved to: ${file.path}')),
+      );
+    } catch (e) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('❌ Download failed: $e')),
+      );
+    }
+  }
+
+  Future<String?> _getAndroidVersion() async {
+    try {
+      final file = File('/system/build.prop');
+      if (await file.exists()) {
+        final lines = await file.readAsLines();
+        for (final line in lines) {
+          if (line.startsWith('ro.build.version.release=')) {
+            return line.split('=')[1];
+          }
+        }
+      }
+    } catch (_) {}
+    return null;
+  }
+
+  // =========================================================
+  // # Delete Image Function
+  // =========================================================
+  Future<void> _deleteImage(String docId, String url) async {
+    final confirm = await showDialog<bool>(
+      context: context,
+      builder: (c) => AlertDialog(
+        title: const Text('Delete image?'),
+        content: const Text('This will permanently remove it from your cloud.'),
+        actions: [
+          TextButton(onPressed: () => Navigator.pop(c, false), child: const Text('Cancel')),
+          TextButton(
+            onPressed: () => Navigator.pop(c, true),
+            child: const Text('Delete', style: TextStyle(color: Colors.red)),
+          ),
+        ],
+      ),
+    );
+
+    if (confirm != true) return;
+
+    final scaffold = ScaffoldMessenger.of(context);
+    try {
+      final ref = FirebaseStorage.instance.refFromURL(url);
+      await ref.delete();
+      await FirebaseFirestore.instance.collection('uploads').doc(docId).delete();
+      scaffold.showSnackBar(const SnackBar(content: Text('Deleted successfully ✅')));
+    } catch (e) {
+      scaffold.showSnackBar(SnackBar(content: Text('Delete failed: $e')));
+    }
+  }
+
+  // =========================================================
+  // # Image Viewer
+  // =========================================================
+  void _openViewer(int startIndex, List<QueryDocumentSnapshot> docs) {
+    Navigator.of(context).push(
+      PageRouteBuilder(
+        opaque: false,
+        pageBuilder: (_, __, ___) => _FullscreenViewer(
+          startIndex: startIndex,
+          docs: docs,
+          onDownload: (url) => _downloadFile(url),
+          onDelete: (docId, url) async {
+            await _deleteImage(docId, url);
+            if (mounted) Navigator.of(context).pop();
+          },
+        ),
+        transitionsBuilder: (_, anim, __, child) {
+          return FadeTransition(opacity: anim, child: child);
+        },
+      ),
+    );
+  }
+
+  // =========================================================
+  // # Main Build
+  // =========================================================
+  @override
+  Widget build(BuildContext context) {
+    final username = user?.email?.split('@').first ?? 'User';
+    final userInitial = username.isNotEmpty ? username[0].toUpperCase() : 'U';
+
+    return Scaffold(
+      extendBodyBehindAppBar: true,
+
+      // # Code for AppBar started
+      appBar: PreferredSize(
+        preferredSize: const Size.fromHeight(56),
+        child: ClipRRect(
+          child: BackdropFilter(
+            filter: ImageFilter.blur(sigmaX: 12, sigmaY: 12),
+            child: AppBar(
+              title: const Text(
+                'CloudVaultora ☁️',
+                style: TextStyle(
+                  color: Colors.black87,
+                  fontWeight: FontWeight.w600,
+                  fontSize: 18,
+                ),
+              ),
+              backgroundColor: Colors.white.withOpacity(0.4),
+              elevation: 0,
+              centerTitle: true,
+              actions: [
+                Builder(
+                  builder: (context) => IconButton(
+                    icon: const Icon(Icons.menu_rounded, color: Colors.black87),
+                    onPressed: () => Scaffold.of(context).openEndDrawer(),
+                  ),
+                ),
+              ],
+            ),
+          ),
+        ),
+      ),
+      // # Code for AppBar end
+
+      // # Code for navbar started
+      endDrawer: Drawer(
+        backgroundColor: Colors.transparent,
+        elevation: 0,
+        child: Stack(
+          children: [
+            ClipRRect(
+              child: BackdropFilter(
+                filter: ImageFilter.blur(sigmaX: 18, sigmaY: 18),
+                child: Container(
+                  decoration: BoxDecoration(
+                    color: Colors.white.withOpacity(0.35),
+                    borderRadius: const BorderRadius.only(
+                      topLeft: Radius.circular(20),
+                    ),
+                  ),
+                  child: SafeArea(
+                    child: Column(
+                      children: [
+                        const SizedBox(height: 24),
+                        // circular profile with gradient ring
+                        Container(
+                          padding: const EdgeInsets.all(3),
+                          decoration: const BoxDecoration(
+                            shape: BoxShape.circle,
+                            gradient: LinearGradient(
+                              colors: [Color(0xFF74EBD5), Color(0xFFACB6E5)],
+                              begin: Alignment.topLeft,
+                              end: Alignment.bottomRight,
+                            ),
+                          ),
+                          child: CircleAvatar(
+                            radius: 45,
+                            backgroundColor: Colors.white,
+                            child: Text(
+                              userInitial,
+                              style: const TextStyle(
+                                fontSize: 36,
+                                fontWeight: FontWeight.bold,
+                                color: Colors.black87,
+                              ),
+                            ),
+                          ),
+                        ),
+                        const SizedBox(height: 12),
+                        Text(
+                          username,
+                          style: const TextStyle(
+                            fontSize: 18,
+                            fontWeight: FontWeight.w600,
+                            color: Colors.black87,
+                          ),
+                        ),
+                        const SizedBox(height: 40),
+                        ListTile(
+                          leading: const Icon(Icons.lock_outline, color: Colors.black87),
+                          title: const Text('Hidden Cabinet', style: TextStyle(color: Colors.black87)),
+                          onTap: () {
+                            ScaffoldMessenger.of(context).showSnackBar(
+                              const SnackBar(content: Text('Hidden Cabinet coming soon 🔒')),
+                            );
+                          },
+                        ),
+                        ListTile(
+                          leading: const Icon(Icons.help_outline, color: Colors.black87),
+                          title: const Text('Help', style: TextStyle(color: Colors.black87)),
+                          onTap: () {
+                            ScaffoldMessenger.of(context).showSnackBar(
+                              const SnackBar(content: Text('Help section coming soon 📘')),
+                            );
+                          },
+                        ),
+                        const Spacer(),
+                        Padding(
+                          padding: const EdgeInsets.only(bottom: 20),
+                          child: ListTile(
+                            leading: const Icon(Icons.logout_rounded, color: Colors.redAccent),
+                            title: const Text('Logout', style: TextStyle(color: Colors.redAccent)),
+                            onTap: () async {
+                              await FirebaseAuth.instance.signOut();
+                              Navigator.pushReplacementNamed(context, '/auth');
+                            },
+                          ),
+                        ),
+                      ],
+                    ),
+                  ),
+                ),
+              ),
+            ),
+          ],
+        ),
+      ),
+      // # Code for navbar end
+
+      // # Main Body (Firebase Images)
+      body: SafeArea(
+        child: StreamBuilder<QuerySnapshot>(
+          stream: FirebaseFirestore.instance
+              .collection('uploads')
+              .where('userId', isEqualTo: user!.uid)
+              .orderBy('timestamp', descending: true)
+              .snapshots(),
+          builder: (context, snapshot) {
+            if (snapshot.connectionState == ConnectionState.waiting) {
+              return const Center(child: CircularProgressIndicator());
+            }
+            if (!snapshot.hasData || snapshot.data!.docs.isEmpty) {
+              return const Center(
+                child: Text('No files uploaded yet ☁️', style: TextStyle(fontSize: 16)),
+              );
+            }
+
+            final docs = snapshot.data!.docs;
+            return GridView.builder(
+              padding: const EdgeInsets.all(12),
+              gridDelegate: const SliverGridDelegateWithFixedCrossAxisCount(
+                crossAxisCount: 2,
+                crossAxisSpacing: 10,
+                mainAxisSpacing: 10,
+              ),
+              itemCount: docs.length,
+              itemBuilder: (context, index) {
+                final data = docs[index].data()! as Map<String, dynamic>;
+                final url = data['url'] as String?;
+                return GestureDetector(
+                  onTap: () => _openViewer(index, docs),
+                  child: ClipRRect(
+                    borderRadius: BorderRadius.circular(12),
+                    child: Image.network(url!, fit: BoxFit.cover),
+                  ),
+                );
+              },
+            );
+          },
+        ),
+      ),
+
+      floatingActionButton: FloatingActionButton.extended(
+        onPressed: _uploadImage,
+        label: _isUploading
+            ? const Text('Uploading...')
+            : const Text('Upload'),
+        icon: _isUploading
+            ? const SizedBox(
+          width: 18,
+          height: 18,
+          child: CircularProgressIndicator(strokeWidth: 2),
+        )
+            : const Icon(Icons.cloud_upload_outlined),
+      ),
+    );
+  }
+}
+
+// =========================================================
+// # Fullscreen Viewer Widget
+// =========================================================
+class _FullscreenViewer extends StatefulWidget {
+  final int startIndex;
+  final List<QueryDocumentSnapshot> docs;
+  final void Function(String url) onDownload;
+  final Future<void> Function(String docId, String url) onDelete;
+
+  const _FullscreenViewer({
+    required this.startIndex,
+    required this.docs,
+    required this.onDownload,
+    required this.onDelete,
+  });
+
+  @override
+  State<_FullscreenViewer> createState() => _FullscreenViewerState();
+}
+
+class _FullscreenViewerState extends State<_FullscreenViewer> {
+  late PageController _controller;
+  late int _current;
+
+  @override
+  void initState() {
+    super.initState();
+    _current = widget.startIndex;
+    _controller = PageController(initialPage: _current);
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      backgroundColor: Colors.black.withOpacity(0.95),
+      body: Stack(
+        children: [
+          PageView.builder(
+            controller: _controller,
+            onPageChanged: (i) => setState(() => _current = i),
+            itemCount: widget.docs.length,
+            itemBuilder: (_, i) {
+              final url = widget.docs[i]['url'] as String;
+              return Center(child: Image.network(url, fit: BoxFit.contain));
+            },
+          ),
+          Positioned(
+            top: 40,
+            right: 20,
+            child: Column(
+              children: [
+                IconButton(
+                  icon: const Icon(Icons.download, color: Colors.white),
+                  onPressed: () => widget.onDownload(widget.docs[_current]['url']),
+                ),
+                IconButton(
+                  icon: const Icon(Icons.delete_outline, color: Colors.redAccent),
+                  onPressed: () => widget.onDelete(
+                    widget.docs[_current].id,
+                    widget.docs[_current]['url'],
+                  ),
+                ),
+                IconButton(
+                  icon: const Icon(Icons.close, color: Colors.white),
+                  onPressed: () => Navigator.pop(context),
+                ),
+              ],
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}v
